@@ -1,10 +1,13 @@
+import { createHash } from "node:crypto";
+
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
-const MAX_HISTORY_MESSAGES = 6;
+const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 900;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 4300;
 const SERPER_TIMEOUT_MS = 1500;
 const GEMINI_TIMEOUT_MS = 3700;
+const SUPABASE_TIMEOUT_MS = 400;
 
 const SYSTEM_PROMPT = [
   "Ты — ChatGPT, голосовой помощник в навыке «ЧАТ ДЖИПИТИ». Ты работаешь на основе Google Gemini.",
@@ -55,6 +58,151 @@ function safeHistory(history) {
     .filter(item => item && (item.role === "user" || item.role === "model") && typeof item.text === "string")
     .slice(-MAX_HISTORY_MESSAGES)
     .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
+}
+
+function getSupabaseConfig() {
+  const urlValue = String(process.env.SUPABASE_URL || "").trim();
+  const key = String(
+    process.env.SUPABASE_SECRET_KEY ||
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    ""
+  ).trim();
+
+  if (!urlValue || !key) return null;
+
+  try {
+    const parsed = new URL(urlValue);
+    if (parsed.protocol !== "https:") return null;
+    return { url: parsed.origin, key };
+  } catch {
+    return null;
+  }
+}
+
+function getMemoryConversationId(session) {
+  const skillId = String(session?.skill_id || "").trim();
+  if (!skillId) return null;
+
+  const userId = String(session?.user?.user_id || "").trim();
+  const applicationId = String(session?.application?.application_id || "").trim();
+  const identityType = userId ? "user" : applicationId ? "application" : "";
+  const identityValue = userId || applicationId;
+
+  // Do not create a shared fallback memory if Yandex provides no stable identity.
+  if (!identityType || !identityValue) return null;
+
+  // Store only a one-way identifier, not the raw Yandex ID.
+  return createHash("sha256")
+    .update(`alice-memory:v1:${skillId}:${identityType}:${identityValue}`)
+    .digest("hex");
+}
+
+async function supabaseRequest(resource, options = {}, timeoutMs = SUPABASE_TIMEOUT_MS) {
+  const config = getSupabaseConfig();
+  if (!config) throw new Error("SUPABASE_NOT_CONFIGURED");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
+  const headers = {
+    ...(options.headers || {}),
+    apikey: config.key
+  };
+
+  // Legacy service_role keys are JWTs. New sb_secret_* keys must be sent as apikey only.
+  if (!config.key.startsWith("sb_")) {
+    headers.Authorization = `Bearer ${config.key}`;
+  } else {
+    delete headers.Authorization;
+  }
+
+  try {
+    const response = await fetch(`${config.url}/rest/v1/${resource}`, {
+      ...options,
+      headers,
+      signal: controller.signal
+    });
+    const raw = await response.text();
+    let data = null;
+    if (raw) {
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        data = raw;
+      }
+    }
+
+    if (!response.ok) {
+      throw new Error(`SUPABASE_HTTP_${response.status}`);
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function loadPersistentHistory(conversationId, timeoutMs = SUPABASE_TIMEOUT_MS) {
+  const filter = new URLSearchParams({
+    select: "history",
+    conversation_id: `eq.${conversationId}`,
+    limit: "1"
+  });
+
+  try {
+    const rows = await supabaseRequest(`alice_memory?${filter.toString()}`, {
+      method: "GET"
+    }, timeoutMs);
+    const row = Array.isArray(rows) ? rows[0] : null;
+    return {
+      ok: true,
+      found: Boolean(row),
+      history: safeHistory(row?.history)
+    };
+  } catch (error) {
+    console.warn("Supabase memory read failed:", error?.message || "unknown error");
+    return { ok: false, found: false, history: [] };
+  }
+}
+
+async function savePersistentHistory(conversationId, history, timeoutMs = SUPABASE_TIMEOUT_MS) {
+  try {
+    await supabaseRequest("alice_memory?on_conflict=conversation_id", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Prefer: "resolution=merge-duplicates,return=minimal"
+      },
+      body: JSON.stringify({
+        conversation_id: conversationId,
+        history: safeHistory(history),
+        updated_at: new Date().toISOString()
+      })
+    }, timeoutMs);
+    return true;
+  } catch (error) {
+    console.warn("Supabase memory write failed:", error?.message || "unknown error");
+    return false;
+  }
+}
+
+async function clearPersistentHistory(conversationId, timeoutMs = SUPABASE_TIMEOUT_MS) {
+  const filter = new URLSearchParams({
+    conversation_id: `eq.${conversationId}`
+  });
+
+  try {
+    await supabaseRequest(`alice_memory?${filter.toString()}`, {
+      method: "DELETE",
+      headers: { Prefer: "return=minimal" }
+    }, timeoutMs);
+    return true;
+  } catch (error) {
+    console.warn("Supabase memory delete failed:", error?.message || "unknown error");
+    return false;
+  }
+}
+
+function isForgetMemoryRequest(text) {
+  return /забуд[ьи]\\s+(?:всё|все|всё обо мне|все факты)|очисти\\s+(?:свою\\s+)?(?:память|историю)|удали\\s+(?:(?:всю|все)\\s+)?(?:память|историю)|сотри\\s+(?:(?:всю|все)\\s+)?(?:память|историю)/i.test(text);
 }
 
 async function fetchJson(url, options, timeoutMs) {
@@ -230,20 +378,62 @@ export default async function handler(req, res) {
   const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
-  const oldHistory = safeHistory(body?.state?.session?.history);
+  const stateHistory = safeHistory(body?.state?.session?.history);
 
   if (!text) {
     return res.status(200).json(aliceResponse(
       "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
       false,
-      oldHistory
+      stateHistory
     ));
+  }
+
+  const yandexSession = body?.session && typeof body.session === "object" ? body.session : {};
+  const supabaseConfig = getSupabaseConfig();
+  const memoryConversationId = supabaseConfig ? getMemoryConversationId(yandexSession) : null;
+
+  if (isForgetMemoryRequest(text)) {
+    if (supabaseConfig && memoryConversationId) {
+      const cleared = await clearPersistentHistory(
+        memoryConversationId,
+        Math.min(SUPABASE_TIMEOUT_MS, Math.max(100, remainingMs() - 100))
+      );
+      if (!cleared) {
+        return res.status(200).json(aliceResponse(
+          "Не удалось очистить сохранённую память прямо сейчас. Попробуйте ещё раз.",
+          false,
+          []
+        ));
+      }
+    }
+    return res.status(200).json(aliceResponse(
+      "Хорошо, начнём с чистого листа.",
+      false,
+      []
+    ));
+  }
+
+  let oldHistory = stateHistory;
+  let canSavePersistentHistory = false;
+
+  if (supabaseConfig && memoryConversationId) {
+    const stored = await loadPersistentHistory(
+      memoryConversationId,
+      Math.min(SUPABASE_TIMEOUT_MS, Math.max(100, remainingMs() - 3500))
+    );
+
+    if (stored.ok) {
+      oldHistory = stored.found ? stored.history : stateHistory;
+      canSavePersistentHistory = true;
+    }
+  } else if (supabaseConfig && !memoryConversationId) {
+    console.warn("Supabase memory skipped: Yandex session has no stable user or application identity.");
   }
 
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
+      // Reserve time for Gemini generation and persistence before starting web search.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
@@ -259,6 +449,14 @@ export default async function handler(req, res) {
       { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
+
+    if (canSavePersistentHistory) {
+      await savePersistentHistory(
+        memoryConversationId,
+        history,
+        Math.min(SUPABASE_TIMEOUT_MS, Math.max(100, remainingMs() - 100))
+      );
+    }
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
