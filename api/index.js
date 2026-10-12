@@ -2,9 +2,9 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4100;
+const TOTAL_RESPONSE_BUDGET_MS = 4300;
 const SERPER_TIMEOUT_MS = 1500;
-const GEMINI_TIMEOUT_MS = 3400;
+const GEMINI_TIMEOUT_MS = 3700;
 
 const SYSTEM_PROMPT = [
   "Ты — голосовой помощник на основе модели Google Gemini, работающий через навык Яндекс Алисы. Алиса — канал общения, а не отдельная модель, которую нужно противопоставлять Gemini.",
@@ -163,7 +163,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         contents,
         generationConfig: {
           temperature: 0.5,
-          maxOutputTokens: 240
+          maxOutputTokens: 180
         }
       })
     },
