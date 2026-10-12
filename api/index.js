@@ -7,7 +7,7 @@ const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 4300;
 const SERPER_TIMEOUT_MS = 1500;
 const GEMINI_TIMEOUT_MS = 3700;
-const SUPABASE_TIMEOUT_MS = 400;
+const SUPABASE_TIMEOUT_MS = 900;
 
 const SYSTEM_PROMPT = [
   "Ты — ChatGPT, голосовой помощник в навыке «ЧАТ ДЖИПИТИ». Ты работаешь на основе Google Gemini.",
@@ -419,7 +419,7 @@ export default async function handler(req, res) {
   if (supabaseConfig && memoryConversationId) {
     const stored = await loadPersistentHistory(
       memoryConversationId,
-      Math.min(SUPABASE_TIMEOUT_MS, Math.max(100, remainingMs() - 3500))
+      Math.min(SUPABASE_TIMEOUT_MS, Math.max(100, remainingMs() - 3400))
     );
 
     if (stored.ok) {
