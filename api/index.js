@@ -70,8 +70,16 @@ async function fetchJson(url, options, timeoutMs) {
 }
 
 async function searchWeb(query, timeoutMs) {
+  const startedAt = Date.now();
   const key = process.env.SERPER_API_KEY;
-  if (!key || timeoutMs < 150) return "";
+  if (!key) {
+    console.warn("Serper search skipped: SERPER_API_KEY is not configured.");
+    return "";
+  }
+  if (timeoutMs < 150) {
+    console.warn("Serper search skipped: insufficient time budget", timeoutMs);
+    return "";
+  }
 
   try {
     const { response, data } = await fetchJson(
@@ -92,7 +100,8 @@ async function searchWeb(query, timeoutMs) {
       return "";
     }
 
-    const items = (Array.isArray(data.organic) ? data.organic : [])
+    const organicResults = Array.isArray(data.organic) ? data.organic : [];
+    const items = organicResults
       .slice(0, 3)
       .map((item, i) => {
         const title = String(item.title || "").slice(0, 180);
@@ -103,6 +112,13 @@ async function searchWeb(query, timeoutMs) {
 
     const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
     if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
+
+    console.info("Serper search completed:", JSON.stringify({
+      durationMs: Date.now() - startedAt,
+      organicResults: organicResults.length,
+      answerBox: Boolean(answerBox)
+    }));
+
     return items.length ? items.join("\n") : "";
   } catch (error) {
     console.warn(
