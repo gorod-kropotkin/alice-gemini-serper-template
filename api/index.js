@@ -204,7 +204,6 @@ async function clearPersistentHistory(conversationId, timeoutMs = SUPABASE_TIMEO
 function isForgetMemoryRequest(text) {
   return /забуд[ьи]\s+(?:всё|все|всё обо мне|все факты)|очисти\s+(?:свою\s+)?(?:память|историю)|удали\s+(?:(?:всю|все)\s+)?(?:память|историю)|сотри\s+(?:(?:всю|все)\s+)?(?:память|историю)/i.test(text);
 }
-}
 
 async function fetchJson(url, options, timeoutMs) {
   const controller = new AbortController();
