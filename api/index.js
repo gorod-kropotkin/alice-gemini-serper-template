@@ -3,7 +3,7 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 4100;
-const SERPER_TIMEOUT_MS = 600;
+const SERPER_TIMEOUT_MS = 1000;
 const GEMINI_TIMEOUT_MS = 3400;
 
 const SYSTEM_PROMPT = [
@@ -105,7 +105,11 @@ async function searchWeb(query, timeoutMs) {
     if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
     return items.length ? items.join("\n") : "";
   } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
+    console.warn(
+      "Serper search failed; continuing without search:",
+      error?.name || "UnknownError",
+      error?.message || "No error message"
+    );
     return "";
   }
 }
