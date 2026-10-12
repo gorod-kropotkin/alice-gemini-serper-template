@@ -7,7 +7,7 @@ const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 4300;
 const SERPER_TIMEOUT_MS = 1500;
 const GEMINI_TIMEOUT_MS = 3700;
-const SUPABASE_TIMEOUT_MS = 900;
+const SUPABASE_TIMEOUT_MS = 1500;
 
 const SYSTEM_PROMPT = [
   "Ты — ChatGPT, голосовой помощник в навыке «ЧАТ ДЖИПИТИ». Ты работаешь на основе Google Gemini.",
@@ -163,13 +163,18 @@ async function loadPersistentHistory(conversationId, timeoutMs = SUPABASE_TIMEOU
   }
 }
 
-async function savePersistentHistory(conversationId, history, timeoutMs = SUPABASE_TIMEOUT_MS) {
+async function savePersistentHistory(
+  conversationId,
+  history,
+  timeoutMs = SUPABASE_TIMEOUT_MS,
+  insertOnly = false
+) {
   try {
     await supabaseRequest("alice_memory?on_conflict=conversation_id", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Prefer: "resolution=merge-duplicates,return=minimal"
+        Prefer: `resolution=${insertOnly ? "ignore-duplicates" : "merge-duplicates"},return=minimal`
       },
       body: JSON.stringify({
         conversation_id: conversationId,
@@ -414,34 +419,41 @@ export default async function handler(req, res) {
   }
 
   let oldHistory = stateHistory;
-  let canSavePersistentHistory = false;
+  let canSavePersistentHistory = Boolean(supabaseConfig && memoryConversationId);
+  let persistentReadSucceeded = false;
 
-  if (supabaseConfig && memoryConversationId) {
-    const stored = await loadPersistentHistory(
-      memoryConversationId,
-      Math.min(SUPABASE_TIMEOUT_MS, Math.max(100, remainingMs() - 3400))
-    );
-
-    if (stored.ok) {
-      oldHistory = stored.found ? stored.history : stateHistory;
-      canSavePersistentHistory = true;
-    }
-  } else if (supabaseConfig && !memoryConversationId) {
+  if (supabaseConfig && !memoryConversationId) {
     console.warn("Supabase memory skipped: Yandex session has no stable user or application identity.");
   }
 
   try {
-    let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Reserve time for Gemini generation and persistence before starting web search.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+    // Read memory and search the web in parallel to fit Alice's response-time budget.
+    const memoryReadPromise = canSavePersistentHistory
+      ? loadPersistentHistory(
+          memoryConversationId,
+          Math.min(SUPABASE_TIMEOUT_MS, Math.max(100, remainingMs() - 2200))
+        )
+      : Promise.resolve({ ok: false, found: false, history: [] });
+
+    const searchPromise = isSearchIntent(text) && process.env.SERPER_API_KEY
+      ? searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2200)))
+      : Promise.resolve("");
+
+    const [stored, searchContext] = await Promise.all([memoryReadPromise, searchPromise]);
+
+    if (stored.ok) {
+      oldHistory = stored.found ? stored.history : stateHistory;
+      persistentReadSucceeded = true;
+    } else if (canSavePersistentHistory) {
+      // On read failure, allow an insert-only write after the answer; never overwrite existing memory.
+      oldHistory = stateHistory;
     }
 
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 700))
     );
 
     const history = [
@@ -451,11 +463,15 @@ export default async function handler(req, res) {
     ].slice(-MAX_HISTORY_MESSAGES);
 
     if (canSavePersistentHistory) {
-      await savePersistentHistory(
+      const saved = await savePersistentHistory(
         memoryConversationId,
         history,
-        Math.min(SUPABASE_TIMEOUT_MS, Math.max(100, remainingMs() - 100))
+        Math.min(SUPABASE_TIMEOUT_MS, Math.max(100, remainingMs() - 100)),
+        !persistentReadSucceeded
       );
+      if (!saved) {
+        console.warn("Supabase memory was not saved for this turn.");
+      }
     }
 
     return res.status(200).json(aliceResponse(answer, false, history));
